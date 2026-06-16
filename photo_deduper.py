@@ -8,12 +8,14 @@ for review and deletion through AppleScript.
 """
 
 import os
+import re
 import sys
 import threading
 import subprocess
 import hashlib
 import datetime
 import pathlib
+import collections
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 from collections import defaultdict
@@ -135,8 +137,8 @@ def compute_hashes(records: list[PhotoRecord], progress_cb=None) -> None:
         if progress_cb and i % 20 == 0:
             progress_cb(i, total, f"Hashing {i:,} / {total:,}")
         try:
-            img = Image.open(rec.path).convert("RGB")
-            rec.phash = imagehash.phash(img, hash_size=HASH_BITS)
+            with Image.open(rec.path) as img:
+                rec.phash = imagehash.phash(img.convert("RGB"), hash_size=HASH_BITS)
         except Exception:
             pass
     if progress_cb:
@@ -165,7 +167,19 @@ def find_duplicates(records: list[PhotoRecord]) -> list[DuplicateGroup]:
         if pu != pv:
             parent[pu] = pv
 
-    # O(n²) comparison — fine up to ~20k photos; add BK-tree if needed
+    MAX_COMPARE = 15_000
+    if len(hashed) > MAX_COMPARE:
+        hashed = hashed[:MAX_COMPARE]
+        import warnings
+        warnings.warn(
+            f"Library has more than {MAX_COMPARE} locally-available photos. "
+            "Duplicate search limited to the first {MAX_COMPARE} to avoid a hang. "
+            "Consider using a BK-tree for full coverage.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    # O(n²) comparison — acceptable up to ~15k photos
     for i, a in enumerate(hashed):
         for b in hashed[i + 1:]:
             if abs(a.phash - b.phash) <= HASH_THRESH:
@@ -199,7 +213,15 @@ def delete_photos_applescript(uuids: list[str]) -> tuple[bool, str]:
     if not uuids:
         return True, "Nothing to delete."
 
-    # Build a comma-separated list of quoted UUIDs for the script
+    # Validate UUIDs before embedding in AppleScript to prevent injection.
+    # Photos UUIDs are hex groups separated by hyphens (standard UUID format).
+    _UUID_RE = re.compile(r'^[0-9A-Fa-f\-]+$')
+    safe = [u for u in uuids if _UUID_RE.match(u)]
+    if len(safe) != len(uuids):
+        bad = [u for u in uuids if not _UUID_RE.match(u)]
+        return False, f"Rejected {len(bad)} UUID(s) with unexpected characters."
+    uuids = safe
+
     uuid_list = ", ".join(f'"{u}"' for u in uuids)
 
     script = f"""
@@ -306,14 +328,21 @@ class PhotoDeduper(tk.Tk):
         self.all_records:    list[PhotoRecord]    = []
         self.groups:         list[DuplicateGroup] = []
         self.current_group:  Optional[int]        = None
-        self._thumb_cache:   dict[str, ImageTk.PhotoImage] = {}
-        self._preview_cache: dict[str, ImageTk.PhotoImage] = {}
+        self._thumb_cache:   collections.OrderedDict[str, ImageTk.PhotoImage] = collections.OrderedDict()
+        self._preview_cache: collections.OrderedDict[str, ImageTk.PhotoImage] = collections.OrderedDict()
+        self._CACHE_MAX = 300
         self._scanning       = False
 
         self._build_ui()
         self.after(200, self._start_scan)
 
     # ── UI construction ───────────────────────────────────────────────────
+
+    def _cache_put(self, cache: collections.OrderedDict, key: str, value) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
+        if len(cache) > self._CACHE_MAX:
+            cache.popitem(last=False)
 
     def _build_ui(self):
         # ── Top bar ──────────────────────────────────────────────────────
@@ -433,10 +462,10 @@ class PhotoDeduper(tk.Tk):
         self.after(0, self._update_status, "Finding duplicates…")
         groups = find_duplicates(records)
 
-        self.all_records = records
-        self.after(0, self._scan_done, groups)
+        self.after(0, self._scan_done, records, groups)
 
-    def _scan_done(self, groups: list[DuplicateGroup]):
+    def _scan_done(self, records: list[PhotoRecord], groups: list[DuplicateGroup]):
+        self.all_records = records
         self.groups = groups
         self._scanning = False
         self.progress_frame.pack_forget()
@@ -514,10 +543,12 @@ class PhotoDeduper(tk.Tk):
         inner.bind("<Configure>", _on_configure)
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
 
-        # Mousewheel scroll
+        # Mousewheel scroll — bind to the canvas only, not app-wide
         def _scroll(e):
             canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _scroll)
+        canvas.bind("<MouseWheel>", _scroll)
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _scroll))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         # Group header
         header = tk.Frame(inner, bg=BG, pady=10, padx=16)
@@ -578,7 +609,7 @@ class PhotoDeduper(tk.Tk):
         thumb = None
         if rec.path and os.path.exists(rec.path):
             if rec.path not in self._thumb_cache:
-                self._thumb_cache[rec.path] = load_thumbnail(rec.path)
+                self._cache_put(self._thumb_cache, rec.path, load_thumbnail(rec.path))
             thumb = self._thumb_cache.get(rec.path)
 
         if thumb is None:
@@ -646,7 +677,7 @@ class PhotoDeduper(tk.Tk):
         win.geometry("900x700")
 
         if path not in self._preview_cache:
-            self._preview_cache[path] = load_preview(path, (860, 640))
+            self._cache_put(self._preview_cache, path, load_preview(path, (860, 640)))
         img = self._preview_cache.get(path)
 
         if img:
@@ -699,8 +730,10 @@ class PhotoDeduper(tk.Tk):
             # Remove from local state
             deleted_set = {r.uuid for r in deleted}
             self.all_records = [r for r in self.all_records if r.uuid not in deleted_set]
-            for g in self.groups:
-                g[:] = [r for r in g if r.uuid not in deleted_set]
+            self.groups = [
+                [r for r in g if r.uuid not in deleted_set]
+                for g in self.groups
+            ]
             self.groups = [g for g in self.groups if len(g) > 1]
 
             self.group_list.delete(0, "end")

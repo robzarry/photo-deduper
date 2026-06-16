@@ -54,7 +54,7 @@ PACKAGES=(
 
 for pkg in "${PACKAGES[@]}"; do
     echo -ne "  Installing ${pkg}…"
-    pip3 install --quiet "$pkg"
+    pip3 install --quiet --user "$pkg"
     echo -e " ${GREEN}✓${NC}"
 done
 
